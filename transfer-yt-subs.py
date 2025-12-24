@@ -14,6 +14,7 @@ class bcolors:
     WARNING = '\033[93m'
     FAIL = '\033[91m'
     ENDC = '\033[0m'
+    BOLD = '\033[1m'
 
 CLIENT_SECRETS_FILE = 'client_secret.json'
 
@@ -25,26 +26,36 @@ API_VERSION = 'v3'
 def get_authenticated_service(export: bool):
   flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
   if export:
-    credentials = flow.run_local_server(port=8080)
+    credentials = flow.run_local_server(port=8080, prompt='consent')
   else:
-    credentials = flow.run_local_server(port=8081)
+    credentials = flow.run_local_server(port=8081, prompt='consent')
   return build(API_SERVICE_NAME, API_VERSION, credentials = credentials)
 
+# Получение имени текущего канала для проверки
+def get_current_channel_name(service):
+  try:
+    response = service.channels().list(part="snippet", mine=True).execute()
+    if response.get('items'):
+      return response['items'][0]['snippet']['title']
+  except Exception as e:
+      print(f"{bcolors.WARNING}Note: Could not retrieve channel name: {e}{bcolors.ENDC}")
+  return "Unknown"
+
 # Вызов API youtube.subscriptions.list для постраничной выгрузки подписок
-def get_chanellsid(target_channels):
+def get_channel_ids(service, target_channels):
   next_page_token = ''
   while True:
-    get_chanellsid_response = youtube.subscriptions().list(
+    response = service.subscriptions().list(
       part="snippet",
       mine=True,
       maxResults=50,
       pageToken=next_page_token
     ).execute()
-    for channelid in get_chanellsid_response['items']:
-      target_channels.append(channelid['snippet']['resourceId']['channelId'])
-    if 'nextPageToken' in get_chanellsid_response:
-      next_page_token = get_chanellsid_response['nextPageToken']
-    else:
+    for item in response.get('items', []):
+      target_channels.append(item['snippet']['resourceId']['channelId'])
+    
+    next_page_token = response.get('nextPageToken')
+    if not next_page_token:
       break
 
 # Вызов API youtube.subscriptions.insert для добавления подписки на канал
@@ -67,39 +78,57 @@ if __name__ == '__main__':
   print(bcolors.WARNING + 'Login to Google-account for export!' + bcolors.ENDC)
   print()
 
-  youtube = get_authenticated_service(export=True)
+  youtube_export = get_authenticated_service(export=True)
+  export_name = get_current_channel_name(youtube_export)
+  print(f"Logged in as (Export): {bcolors.OKGREEN}{export_name}{bcolors.ENDC}")
+
   export_account_channels = []
-  get_chanellsid(export_account_channels)
+  get_channel_ids(youtube_export, export_account_channels)
+  print(f"Found {len(export_account_channels)} subscriptions in Export account.")
+
+  print(f"\n{bcolors.WARNING}--- EXPORT COMPLETE ---{bcolors.ENDC}")
+  input(f"Press {bcolors.OKGREEN}Enter{bcolors.ENDC} to proceed to the IMPORT account login...")
 
   print()
   print(bcolors.WARNING + 'Login to Google-account for import!' + bcolors.ENDC)
   print()
 
-  youtube = get_authenticated_service(export=False)
-  import_account_channels = []
-  get_chanellsid(import_account_channels)
+  youtube_import = get_authenticated_service(export=False)
+  import_name = get_current_channel_name(youtube_import)
+  print(f"Logged in as (Import): {bcolors.OKGREEN}{import_name}{bcolors.ENDC}")
 
-  channels_to_add = list(set(export_account_channels) ^ set(import_account_channels)) # Извлечение еще неоформленных подписок на импорт-аккаунте
+  import_account_channels = []
+  get_channel_ids(youtube_import, import_account_channels)
+  print(f"Found {len(import_account_channels)} subscriptions in Import account.")
+
+  # Use set difference (export - import) to find channels in export that are NOT in import
+  channels_to_add = list(set(export_account_channels) - set(import_account_channels)) 
   channels_to_add_quantity = len(channels_to_add)
 
-  if channels_to_add_quantity > 200:
-    print()
-    print(bcolors.WARNING + 'Channels quantity ('+ str(channels_to_add_quantity) +') greater than API quota! Wait for the end of execution and try again next day!' + bcolors.ENDC)
-    print(bcolors.WARNING + 'API quota is 200 subscriptions' + bcolors.ENDC)
-    print()
-  elif channels_to_add_quantity == 0:
-    print()
-    print(bcolors.WARNING + 'Count of channels to subscription - '+ str(channels_to_add_quantity) + bcolors.ENDC)
-    quit()
-  else:
-    print()
-    print(bcolors.WARNING + 'Count of channels to subscription - '+ str(channels_to_add_quantity) + bcolors.ENDC)
-    print()
+  print(f"\n{bcolors.BOLD}SYNC ANALYSIS:{bcolors.ENDC}")
+  print(f"Export Account Total: {len(export_account_channels)}")
+  print(f"Import Account Total: {len(import_account_channels)}")
+  print(f"New channels to add: {bcolors.OKGREEN}{channels_to_add_quantity}{bcolors.ENDC}")
 
+  if channels_to_add_quantity == 0:
+    print(f"\n{bcolors.OKGREEN}Accounts are already in sync! No actions needed.{bcolors.ENDC}")
+    quit()
+  
+  if channels_to_add_quantity > 180:
+      print(f"\n{bcolors.WARNING}WARNING: You are about to add {channels_to_add_quantity} subscriptions.{bcolors.ENDC}")
+      print("This is close to or exceeds the daily API limit (~200).")
+      print("The script will stop automatically if the limit is reached.")
+
+  confirm = input(f"\nDo you want to proceed with adding {channels_to_add_quantity} subscriptions? (y/n): ")
+  if confirm.lower() != 'y':
+      print("Operation cancelled by user.")
+      quit()
+
+  print()
   counter = 0
   try:
     for channel_id in channels_to_add:
-      add_subscription(youtube, channel_id)
+      add_subscription(youtube_import, channel_id)
       counter += 1
   except HttpError as e:
     print()
